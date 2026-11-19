@@ -1,0 +1,73 @@
+{
+  "name": "dsh-plugin-matrix-bridge",
+  "version": "0.1.0",
+  "description": "把 Matrix 房间的消息转发进 DSH 会话作为用户输入，把会话回复发回 Matrix；支持端到端加密（E2EE）、主动发送与多房间关联。",
+  "type": "module",
+  "main": "index.js",
+  "icon": "./icon.svg",
+  "exports": {
+    ".": "./index.js",
+    "./client": {
+      "default": "./client.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "lib",
+    "cordis.patch.yml",
+    "icon.svg",
+    "README.md",
+    "LICENSE",
+    "test"
+  ],
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "dsh-plugin",
+    "matrix",
+    "e2ee",
+    "element",
+    "bridge"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "author": "bluemika111",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bluemika111/dsh-plugin-matrix-bridge.git"
+  },
+  "homepage": "https://github.com/bluemika111/dsh-plugin-matrix-bridge#readme",
+  "bugs": {
+    "url": "https://github.com/bluemika111/dsh-plugin-matrix-bridge/issues"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
+    }
+  },
+  "meta": {
+    "title": "Matrix 桥接",
+    "description": "把 Matrix 房间消息作为用户输入转发进会话，并把回复发回房间；支持 E2EE 与主动发送。"
+  },
+  "scripts": {
+    "test": "node test/smoke.test.mjs && node test/e2e.test.mjs"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@matrix-org/matrix-sdk-crypto-nodejs": "0.4.0",
+    "matrix-bot-sdk": "^0.8.0"
+  }
+}

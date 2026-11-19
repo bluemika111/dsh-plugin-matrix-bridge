@@ -1,0 +1,3 @@
+- insert:
+    - id: dsh-matrix-bridge
+      name: dsh-plugin-matrix-bridge
