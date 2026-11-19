@@ -232,6 +232,7 @@ export function apply(ctx, config = {}) {
   const serverRoomIds = new Map() // roomKey -> the exact spelling the server answers with
   const waitingReply = new Map() // sessionId -> [{ roomId, roomName, at }]
   const lastAssistant = new Map() // sessionId -> { turn, text }
+  const lastUserRpc = new Map() // sessionId -> rpcId of the newest user message
   let sending = Promise.resolve()
 
   const logger = () => ({
@@ -888,7 +889,15 @@ export function apply(ctx, config = {}) {
       signal,
     )
     const queue = waitingReply.get(binding.sessionId) ?? []
-    queue.push({ roomId: binding.roomId, roomName: binding.roomName, at: Date.now() })
+    // The requestId is the only handle that ties this admission to the turn it
+    // opens: the host echoes it back on the `user/message` event as `source.rpcId`.
+    queue.push({
+      roomId: binding.roomId,
+      roomName: binding.roomName,
+      at: Date.now(),
+      requestId,
+      admitted: false,
+    })
     waitingReply.set(binding.sessionId, queue)
     note('admitted', `已把消息投递给会话 ${binding.sessionId.slice(0, 8)}`)
   }
@@ -961,18 +970,52 @@ export function apply(ctx, config = {}) {
   ctx.on('session/event', (session, event) => {
     const sessionId = session?.id
     if (typeof sessionId !== 'string') return
+
+    // The host echoes our prompt's requestId back as `source.rpcId` on the
+    // user message it creates. Remembering it is what keeps an unrelated turn
+    // (the user typing in that Session themselves) from being sent to Matrix.
+    if (event?.type === 'user/message') {
+      const rpcId = event.data?.source?.rpcId
+      if (typeof rpcId === 'string' && rpcId !== '') {
+        lastUserRpc.set(sessionId, rpcId)
+        const pending = waitingReply.get(sessionId)
+        if (pending !== undefined) {
+          for (const entry of pending) if (entry.requestId === rpcId) entry.admitted = true
+        }
+      }
+      return
+    }
+
     if (event?.type === 'assistant/message') {
+      // Only sessions with an answer waiting are worth tracking: this listener
+      // sees every Session in the profile.
+      if (!waitingReply.has(sessionId)) return
       const text = extractAssistantText(event.data?.message)
       if (text !== '') lastAssistant.set(sessionId, { turn: event.data?.turn, text })
       return
     }
+
     if (event?.type !== 'turn/end') return
     const queue = waitingReply.get(sessionId)
     if (queue === undefined || queue.length === 0) return
-    const entry = queue.shift()
+
+    const rpcId = lastUserRpc.get(sessionId)
+    let index
+    if (typeof rpcId === 'string' && rpcId !== '') {
+      // This turn was opened by one specific user message: answer it only if
+      // that message is ours.
+      index = queue.findIndex((entry) => entry.requestId === rpcId)
+    } else {
+      // The host did not report an rpcId (older payload): fall back to the
+      // oldest outstanding admission.
+      index = 0
+    }
+    if (index === -1) return
+
+    const [entry] = queue.splice(index, 1)
     if (queue.length === 0) waitingReply.delete(sessionId)
+    lastUserRpc.delete(sessionId)
     const last = lastAssistant.get(sessionId)
-    // Only the turn this input opened is answered; an unrelated turn is not.
     if (last === undefined || last.turn !== event.data?.turn) return
     void deliver(entry.roomId, last.text)
   })

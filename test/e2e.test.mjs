@@ -257,20 +257,40 @@ assert.match(
 const sessionEvent = listeners.find((entry) => entry.event === 'session/event')
 assert.ok(sessionEvent !== undefined, 'session/event listener should be registered')
 
-// The turn this input opened, then its end.
+// (1) 用户自己在这个会话里打字：这个 turn 不是 Matrix 投递开启的，不能被发出去。
+sessionEvent.handler({ id: 'session-1' }, {
+  type: 'user/message',
+  data: { source: { kind: 'user', rpcId: 'user-typed-1' } },
+})
 sessionEvent.handler({ id: 'session-1' }, {
   type: 'assistant/message',
-  data: { turn: 7, message: { content: [{ type: 'text', text: '收到，我在。' }] } },
+  data: { turn: 1, message: { content: [{ type: 'text', text: '用户自己的对话' }] } },
 })
-sessionEvent.handler({ id: 'session-1' }, { type: 'turn/end', data: { turn: 7 } })
+sessionEvent.handler({ id: 'session-1' }, { type: 'turn/end', data: { turn: 1 } })
+await sleep(300)
+assert.equal(sent.length, 0, 'a turn opened by the user must not be sent to Matrix')
 
-// The encrypted room, with no crypto layer available: this must NOT send
-// plaintext into a room the server says is end-to-end encrypted.
+// (2) Matrix 投递的那条被宿主接收（requestId 以 source.rpcId 回显），这一轮结束。
+sessionEvent.handler({ id: 'session-1' }, {
+  type: 'user/message',
+  data: { source: { kind: 'user', rpcId: plain.requestId } },
+})
+sessionEvent.handler({ id: 'session-1' }, {
+  type: 'assistant/message',
+  data: { turn: 2, message: { content: [{ type: 'text', text: '收到，我在。' }] } },
+})
+sessionEvent.handler({ id: 'session-1' }, { type: 'turn/end', data: { turn: 2 } })
+
+// (3) 加密房间同样走完配对，但加密层不在：必须拒绝发明文。
+sessionEvent.handler({ id: 'session-2' }, {
+  type: 'user/message',
+  data: { source: { kind: 'user', rpcId: secret.requestId } },
+})
 sessionEvent.handler({ id: 'session-2' }, {
   type: 'assistant/message',
-  data: { turn: 8, message: { content: [{ type: 'text', text: '这段不该发出去' }] } },
+  data: { turn: 1, message: { content: [{ type: 'text', text: '这段不该发出去' }] } },
 })
-sessionEvent.handler({ id: 'session-2' }, { type: 'turn/end', data: { turn: 8 } })
+sessionEvent.handler({ id: 'session-2' }, { type: 'turn/end', data: { turn: 1 } })
 
 const replyDeadline = Date.now() + 5_000
 while (sent.length === 0 && Date.now() < replyDeadline) await sleep(50)
