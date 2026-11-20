@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-matrix-bridge",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "把 Matrix 房间的消息转发进 DSH 会话作为用户输入，把会话回复发回 Matrix；支持端到端加密（E2EE）、主动发送与多房间关联。",
   "type": "module",
   "main": "index.js",

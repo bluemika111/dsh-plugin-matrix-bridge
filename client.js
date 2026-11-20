@@ -42,6 +42,10 @@ window.__ModuleLoader__.load({
       error: "var(--dsw-alias-state-error-primary)",
     };
 
+    /** Room kinds the host classifies: server notices, direct message, group. */
+    const KIND_LABEL = { notice: "通知", dm: "私聊", room: "群聊" };
+    const KIND_COLOR = { notice: token.warn, dm: token.ok, room: token.dim };
+
     async function api(path, options) {
       const response = await fetch(`${API}${path}`, options);
       const payload = await response.json().catch(() => null);
@@ -284,7 +288,8 @@ window.__ModuleLoader__.load({
       };
 
       const connection = (state && state.connection) || {};
-      const binding = state ? state.binding : null;
+      // One Session may hold several bindings (DM + group + server notices).
+      const bindings = state && Array.isArray(state.binding) ? state.binding : [];
       const rooms = (state && state.rooms) || [];
       const deps = (state && state.deps) || {};
       const connected = connection.connected === true;
@@ -414,21 +419,110 @@ window.__ModuleLoader__.load({
         h(
           Section,
           { title: "房间" },
-          binding
-            ? h(
+          bindings.length === 0
+            ? h("div", { style: { fontSize: 12, color: token.dim, padding: "4px 0" } }, "本会话还没有关联房间")
+            : h(
                 "div",
-                { style: { fontSize: 12, color: token.text, padding: "4px 0" } },
-                `本会话已关联：${binding.roomName || binding.roomId}`,
-              )
-            : h("div", { style: { fontSize: 12, color: token.dim, padding: "4px 0" } }, "本会话还没有关联房间"),
+                { style: { display: "flex", flexDirection: "column", gap: 6, padding: "4px 0" } },
+                bindings.map((item) =>
+                  h(
+                    "div",
+                    {
+                      key: item.roomId,
+                      style: {
+                        display: "flex",
+                        flexDirection: "column",
+                        gap: 2,
+                        padding: "6px 8px",
+                        borderRadius: 8,
+                        border: `1px solid ${token.border}`,
+                        background: token.surface2,
+                      },
+                    },
+                    h(
+                      "div",
+                      { style: { display: "flex", alignItems: "center", gap: 8 } },
+                      h(
+                        "span",
+                        {
+                          style: {
+                            fontSize: 10,
+                            lineHeight: "16px",
+                            padding: "0 6px",
+                            borderRadius: 999,
+                            border: `1px solid ${KIND_COLOR[item.kind] || token.dim}`,
+                            color: KIND_COLOR[item.kind] || token.dim,
+                            flex: "0 0 auto",
+                          },
+                        },
+                        KIND_LABEL[item.kind] || "群聊",
+                      ),
+                      h(
+                        "span",
+                        {
+                          style: {
+                            fontSize: 12,
+                            color: token.text,
+                            flex: "1 1 auto",
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
+                            whiteSpace: "nowrap",
+                          },
+                          title: item.roomId,
+                        },
+                        item.roomName || item.roomId,
+                      ),
+                      h(
+                        Button,
+                        {
+                          disabled: busy,
+                          onClick: () =>
+                            run(() => post("/unbind", { sessionId, roomId: item.roomId }), "已解除"),
+                        },
+                        "解除",
+                      ),
+                    ),
+                    h(Switch, {
+                      checked: item.mentionOnly,
+                      disabled: busy,
+                      label: "仅被@时才回复",
+                      onChange: (value) =>
+                        run(() => post("/options", { sessionId, roomId: item.roomId, mentionOnly: value })),
+                    }),
+                    h(Switch, {
+                      checked: item.enabled,
+                      disabled: busy,
+                      label: "启用这个关联",
+                      onChange: (value) =>
+                        run(() => post("/options", { sessionId, roomId: item.roomId, enabled: value })),
+                    }),
+                    h(Switch, {
+                      checked: item.reply !== false,
+                      disabled: busy,
+                      label: "自动回复",
+                      hint: "关掉后消息照常投递进会话，但不会把回复发回这个房间（服务器通知通常不需要回）。",
+                      onChange: (value) =>
+                        run(() => post("/options", { sessionId, roomId: item.roomId, reply: value })),
+                    }),
+                    h(Switch, {
+                      checked: item.authoritative,
+                      disabled: busy,
+                      label: "作为用户权威输入",
+                      hint: "关闭时正文前加来源说明与「输入不可信」提示；打开则原样转发。",
+                      onChange: (value) =>
+                        run(() => post("/options", { sessionId, roomId: item.roomId, authoritative: value })),
+                    }),
+                  ),
+                ),
+              ),
           h(
             "div",
-            { style: { display: "flex", gap: 8, alignItems: "flex-end", flexWrap: "wrap" } },
+            { style: { display: "flex", gap: 8, alignItems: "flex-end", flexWrap: "wrap", paddingTop: 6 } },
             h(
               "div",
               { style: { flex: "1 1 220px", minWidth: 180 } },
               h(Field, {
-                label: "房间",
+                label: "再关联一个房间",
                 value: roomId ?? "",
                 onChange: (value) => {
                   setRoomId(value);
@@ -460,16 +554,6 @@ window.__ModuleLoader__.load({
               },
               "关联到本会话",
             ),
-            binding
-              ? h(
-                  Button,
-                  {
-                    disabled: busy,
-                    onClick: () => run(() => post("/unbind", { sessionId }), "已解除关联"),
-                  },
-                  "解除关联",
-                )
-              : null,
           ),
           rooms.length > 0
             ? h(
@@ -502,47 +586,16 @@ window.__ModuleLoader__.load({
                       },
                       title: room.roomId || room.key,
                     },
-                    `${room.encrypted ? "🔒 " : ""}${room.name}`,
+                    `${room.kind === "notice" ? "🔔 " : room.encrypted ? "🔒 " : ""}${room.name}`,
                   ),
                 ),
               )
             : null,
         ),
 
-        binding
-          ? h(
-              Section,
-              { title: "房间规则" },
-              h(Switch, {
-                checked: binding.mentionOnly,
-                disabled: busy,
-                label: "仅被@时才回复",
-                hint: "打开时，房间里没有 @ 机器人的消息不会进入本会话，也不会回复。",
-                onChange: (value) => run(() => post("/options", { sessionId, mentionOnly: value })),
-              }),
-              h(Switch, {
-                checked: binding.enabled,
-                disabled: busy,
-                label: "启用这个关联",
-                hint: "关掉后消息照常同步，但不会投递进本会话。",
-                onChange: (value) => run(() => post("/options", { sessionId, enabled: value })),
-              }),
-            )
-          : null,
-
         h(
           Section,
           { title: "高级" },
-          h(Switch, {
-            checked: binding ? binding.authoritative : false,
-            disabled: busy || binding === null,
-            label: "将 Matrix 消息作为用户权威输入",
-            hint:
-              binding === null
-                ? "先关联一个房间，这个开关才有意义。"
-                : "关闭时正文前会加来源说明与「输入不可信」提示；打开则原样转发。",
-            onChange: (value) => run(() => post("/options", { sessionId, authoritative: value })),
-          }),
           h(Switch, {
             checked: connection.encryption !== "off",
             disabled: busy,
@@ -557,6 +610,17 @@ window.__ModuleLoader__.load({
             label: "自动接受房间邀请",
             hint: "打开时，别人邀请机器人进房间会自动加入。",
             onChange: (value) => run(() => post("/connection", { acceptInvites: value })),
+          }),
+          h(Switch, {
+            checked: connection.noticeSessionId === sessionId,
+            disabled: busy,
+            label: "自动绑定服务器通知房间",
+            hint: "打开后，服务器通知房间（Admin Room / Server Notices）会自动关联到本会话，只收不回。",
+            onChange: (value) =>
+              run(
+                () => post("/connection", { noticeSessionId: value ? sessionId : "" }),
+                value ? "已设为通知房间的目标会话" : "已关闭自动绑定",
+              ),
           }),
         ),
 
@@ -709,7 +773,7 @@ window.__ModuleLoader__.load({
       if (sessionId === "") return null;
 
       const connection = (state && state.connection) || {};
-      const binding = state ? state.binding : null;
+      const bindings = state && Array.isArray(state.binding) ? state.binding : [];
       const connected = connection.connected === true;
       const cryptoState = connection.cryptoState || "off";
 
@@ -724,14 +788,18 @@ window.__ModuleLoader__.load({
         return colon > 0 ? body.slice(0, colon) : body;
       };
       const rooms = (state && state.rooms) || [];
-      const boundRoom = binding
-        ? rooms.find((room) => roomKeyOf(room.roomId) === roomKeyOf(binding.roomId))
-        : null;
-      const roomLabel = boundRoom && boundRoom.name ? boundRoom.name : binding ? binding.roomName || binding.roomId : "";
+      const labelOf = (item) => {
+        const live = rooms.find((room) => roomKeyOf(room.roomId) === roomKeyOf(item.roomId));
+        return live && live.name ? live.name : item.roomName || item.roomId;
+      };
 
-      const summary = binding
-        ? `${roomLabel}${binding.mentionOnly ? " · 仅@" : ""}`
-        : "未关联房间";
+      const noticeCount = bindings.filter((item) => item.kind === "notice").length;
+      const summary =
+        bindings.length === 0
+          ? "未关联房间"
+          : bindings.length === 1
+            ? `${labelOf(bindings[0])}${bindings[0].mentionOnly ? " · 仅@" : ""}`
+            : `${bindings.length} 个房间${noticeCount > 0 ? `（${noticeCount} 通知）` : ""}`;
 
       const tone = !connected ? "idle" : cryptoState === "ready" ? "ok" : "warn";
       const dotColor = tone === "ok" ? token.ok : tone === "warn" ? token.warn : token.idle;

@@ -30,6 +30,8 @@ const ROUTE_PREFIX = '/dsh-matrix-bridge'
 const LOG_LIMIT = 160
 const CALL_TIMEOUT_MS = 120_000
 const PENDING_TIMEOUT_MS = 10 * 60 * 1000
+/** 首次同步时，多新的消息才算「重启前后刚发的」而不是历史回放。 */
+const BOOTSTRAP_FRESH_MS = 60_000
 const MAX_MEDIA_BYTES = 32 * 1024 * 1024
 const DEFAULT_SYNC_TIMEOUT = 30_000
 
@@ -81,6 +83,8 @@ function normalizeConnection(raw) {
     autoConnect: source.autoConnect === true,
     acceptInvites: source.acceptInvites !== false,
     syncTimeoutMs: clamp(source.syncTimeoutMs, 5_000, 90_000, DEFAULT_SYNC_TIMEOUT),
+    // 服务器通知房间自动挂到这个会话；空串表示不自动绑定。
+    noticeSessionId: String(source.noticeSessionId ?? '').trim(),
   }
 }
 
@@ -95,6 +99,9 @@ function normalizeBinding(raw, sessionId) {
     mentionOnly: raw.mentionOnly === true,
     enabled: raw.enabled !== false,
     authoritative: raw.authoritative === true,
+    // Server notices rarely want an answer; the flag is per binding so a DM
+    // and a notice room can share one Session with different behaviour.
+    reply: raw.reply !== false,
     updatedAt: Number(raw.updatedAt) > 0 ? Number(raw.updatedAt) : Date.now(),
   }
 }
@@ -107,13 +114,20 @@ function writeConnection(home, patch) {
   return next
 }
 
+/**
+ * One Session may be wired to several rooms — a DM plus a group, or a server's
+ * admin room plus a notification room. The on-disk shape is therefore
+ * `sessionId -> binding[]`; the single-object form written by 0.1.x is still
+ * read and upgraded in place.
+ */
 function readBindings(home) {
   const raw = readJsonFile(bindingsPath(home), {})
   const out = {}
   if (raw !== null && typeof raw === 'object') {
     for (const [sessionId, value] of Object.entries(raw)) {
-      const binding = normalizeBinding(value, sessionId)
-      if (binding !== null) out[sessionId] = binding
+      const list = Array.isArray(value) ? value : [value]
+      const bindings = list.map((item) => normalizeBinding(item, sessionId)).filter((item) => item !== null)
+      if (bindings.length > 0) out[sessionId] = bindings
     }
   }
   return out
@@ -228,6 +242,7 @@ export function apply(ctx, config = {}) {
   const roomNames = new Map() // roomKey -> display name
   const roomEncrypted = new Set() // roomKey of rooms that are encrypted
   const roomMemberCounts = new Map() // roomKey -> joined member count
+  const roomKinds = new Map() // roomKey -> 'notice' | 'dm' | 'room'
   const nameAttempted = new Set() // roomKey whose name was already asked for
   const serverRoomIds = new Map() // roomKey -> the exact spelling the server answers with
   const waitingReply = new Map() // sessionId -> [{ roomId, roomName, at }]
@@ -390,11 +405,35 @@ export function apply(ctx, config = {}) {
   }
 
   /**
+   * 服务器通知房间的虚拟用户。
+   *
+   * Synapse 叫 `@server:<domain>`，Conduit/tuwunel 叫 `@conduit:<domain>`。
+   * 它们通常没有显示名——真人管理员（`@admin`）有，所以「localpart 命中 +
+   * 没有显示名」这一条能把两者分开。
+   */
+  const SERVER_BOT_LOCALPARTS = new Set(['server', 'conduit', 'dendrite', 'synapse'])
+
+  function isServerBot(userId, info) {
+    if (typeof userId !== 'string' || !userId.startsWith('@')) return false
+    if (!SERVER_BOT_LOCALPARTS.has(localpart(userId).toLowerCase())) return false
+    return String(info?.display_name ?? '').trim() === ''
+  }
+
+  /** 房间类型：通知房间 / 私聊 / 普通群聊。 */
+  function classifyRoom(members, name) {
+    const ids = Object.keys(members)
+    if (ids.some((userId) => isServerBot(userId, members[userId]))) return 'notice'
+    if (/admin room|server notices/i.test(name)) return 'notice'
+    if (ids.length === 2) return 'dm'
+    return 'room'
+  }
+
+  /**
    * 给房间起一个能认人的名字。
    *
    * 私聊房间通常既没有 `m.room.name` 也没有别名，只剩成员表——那种情况下用对方的
-   * 显示名，比甩一串 `!opaque:server` 有用得多。成员数顺手记下来，消息头靠它区分
-   * 私聊与群聊。
+   * 显示名，比甩一串 `!opaque:server` 有用得多。成员数与房间类型顺手记下来，
+   * 消息头靠它们区分私聊、群聊与服务器通知。
    */
   async function resolveRoomName(roomId) {
     if (matrix === null) return roomId
@@ -402,7 +441,10 @@ export function apply(ctx, config = {}) {
     const name = await matrix.roomName(roomId).catch(() => null)
     const alias = name === null ? await matrix.roomAlias(roomId).catch(() => null) : null
     const members = await matrix.joinedMembers(roomId).catch(() => null)
-    if (members !== null) roomMemberCounts.set(key, Object.keys(members).length)
+    if (members !== null) {
+      roomMemberCounts.set(key, Object.keys(members).length)
+      roomKinds.set(key, classifyRoom(members, name ?? alias ?? ''))
+    }
     if (name) return name
     if (alias) return alias
     if (members !== null) {
@@ -421,10 +463,21 @@ export function apply(ctx, config = {}) {
     return roomId
   }
 
-  /** 名字缺失时补一次；同一个房间只问服务端一次，失败就先用房间号顶着。 */
+  /**
+   * 名字缺失时补一次；同一个房间只问服务端一次，失败就先用房间号顶着。
+   *
+   * 名字有缓存时也要确认类型算过——房间名会先于类型被记住（rooms.json 持久化），
+   * 重启后 name 命中缓存、kind 却是空的，绑定就会把通知房间当成普通房间。
+   */
   async function ensureRoomName(roomId) {
     const key = roomKey(roomId)
     const cached = roomNames.get(key)
+    if (cached !== undefined && !roomKinds.has(key)) {
+      const resolved = await resolveRoomName(roomId)
+      roomNames.set(key, resolved)
+      writeRooms(home, Object.fromEntries(roomNames))
+      return resolved
+    }
     if (cached !== undefined && cached !== roomId) return cached
     if (nameAttempted.has(key)) return cached ?? roomId
     nameAttempted.add(key)
@@ -432,6 +485,46 @@ export function apply(ctx, config = {}) {
     roomNames.set(key, resolved)
     writeRooms(home, Object.fromEntries(roomNames))
     return resolved
+  }
+
+  /**
+   * 把单个通知房间挂到目标会话。
+   *
+   * 逐房间调用而不是只在 sync 末尾扫一遍：新房间的第一条消息就在同一帧里，
+   * 绑定晚一步，那条消息就会被当成「没有会话关心」丢掉。
+   */
+  async function autoBindNotice(roomId) {
+    const target = connection.noticeSessionId
+    if (target === '' || matrix === null) return
+    const key = roomKey(roomId)
+    if (roomKinds.get(key) !== 'notice') return
+    const list = bindings[target] ?? []
+    if (list.some((item) => roomKey(item.roomId) === key)) return
+    const id = serverRoomIds.get(key) ?? roomId
+    const binding = normalizeBinding(
+      {
+        roomId: id,
+        roomName: roomNames.get(key) ?? id,
+        reply: false,
+        enabled: true,
+        updatedAt: Date.now(),
+      },
+      target,
+    )
+    if (binding === null) return
+    list.push(binding)
+    bindings = { ...bindings, [target]: list }
+    writeBindings(home, bindings)
+    note('bound', `自动绑定服务器通知房间「${binding.roomName}」到会话 ${target.slice(0, 8)}`)
+  }
+
+  /** 全量扫一遍：连接建立、首次同步之后用。 */
+  async function autoBindNotices() {
+    if (connection.noticeSessionId === '' || matrix === null) return
+    for (const [key, kind] of roomKinds) {
+      if (kind !== 'notice') continue
+      await autoBindNotice(serverRoomIds.get(key) ?? `!${key}`)
+    }
   }
 
   /** 从服务端把房间清单、名字与加密状态拉一遍。不依赖 sync：重启后 sync 不重放房间。 */
@@ -454,8 +547,9 @@ export function apply(ctx, config = {}) {
     for (const roomId of rooms) {
       const key = roomKey(roomId)
       const cached = roomNames.get(key)
-      // 缓存里只有房间号说明上次没拉到名字（多半是私聊），再问一次。
-      if (cached === undefined || cached === roomId) {
+      // 缓存里只有房间号说明上次没拉到名字（多半是私聊），再问一次；
+      // 没有类型说明还没分类过，也要补一次。
+      if (cached === undefined || cached === roomId || !roomKinds.has(key)) {
         roomNames.set(key, await resolveRoomName(roomId))
       }
       const encryption = await matrix.roomState(roomId, 'm.room.encryption').catch(() => null)
@@ -463,6 +557,7 @@ export function apply(ctx, config = {}) {
     }
     writeRooms(home, Object.fromEntries(roomNames))
     note('rooms', `已加载 ${rooms.length} 个房间`)
+    await autoBindNotices()
   }
 
   /* ---------------------------------------------------------- sync */
@@ -606,25 +701,40 @@ export function apply(ctx, config = {}) {
     return false
   }
 
-  /** 首次同步：补齐房间状态，把最近的历史回填进记录。不把时间线当成新消息。 */
+  /**
+   * 首次同步：补齐房间状态。
+   *
+   * 时间线默认不当成新消息——重启后重放历史会把会话刷满。但刚发的消息会因此
+   * 丢掉，所以最近一分钟内的仍然投递：那个窗口里的事件只可能是「重启前后刚发
+   * 的」，不可能是历史。
+   */
   async function bootstrap(response) {
     // 邀请先处理：它跟时间线无关，不该被后面的任何一步挡住。
     await handleInvites(response)
     const joined = response.rooms?.join ?? {}
+    const now = Date.now()
     for (const [roomId, data] of Object.entries(joined)) {
       rememberServerRoom(roomId)
+      const name = roomNames.get(roomKey(roomId))
+      if (name === undefined || name === roomId || !roomKinds.has(roomKey(roomId))) {
+        roomNames.set(roomKey(roomId), await resolveRoomName(roomId))
+      }
+      // 分类完立刻绑定，下面补投的第一条通知才有会话可去。
+      await autoBindNotice(roomId)
       for (const event of data.state?.events ?? []) applyState(roomId, event)
       // 初始同步把房间创建时的状态事件放在时间线里：不扫一遍就会漏掉 m.room.encryption。
       for (const event of data.timeline?.events ?? []) {
         if (event.state_key !== undefined) applyState(roomId, event)
       }
-      const name = roomNames.get(roomKey(roomId))
-      if (name === undefined || name === roomId) {
-        roomNames.set(roomKey(roomId), await resolveRoomName(roomId))
+      for (const event of data.timeline?.events ?? []) {
+        if (event.state_key !== undefined) continue
+        const at = Number(event.origin_server_ts) || 0
+        if (at > 0 && now - at <= BOOTSTRAP_FRESH_MS) await handleTimelineEvent(roomId, event)
       }
     }
     writeRooms(home, Object.fromEntries(roomNames))
     note('rooms', `首次同步完成，${Object.keys(joined).length} 个房间`)
+    await autoBindNotices()
   }
 
   /**
@@ -658,6 +768,13 @@ export function apply(ctx, config = {}) {
     const joined = response.rooms?.join ?? {}
     for (const [roomId, data] of Object.entries(joined)) {
       rememberServerRoom(roomId)
+      // 新加入的房间还没分类过：补一次，通知房间才能被自动绑定。
+      if (!roomKinds.has(roomKey(roomId))) {
+        roomNames.set(roomKey(roomId), await resolveRoomName(roomId))
+      }
+      // 分类完立刻绑定，再处理这一帧的时间线——否则这个房间的第一条通知
+      // 会在绑定建立之前就被丢掉。
+      await autoBindNotice(roomId)
       for (const event of data.state?.events ?? []) applyState(roomId, event)
       for (const event of data.timeline?.events ?? []) {
         if (event.state_key !== undefined) applyState(roomId, event)
@@ -674,6 +791,7 @@ export function apply(ctx, config = {}) {
         await handleTimelineEvent(roomId, event)
       }
     }
+    await autoBindNotices()
   }
 
   async function handleTimelineEvent(roomId, event) {
@@ -689,9 +807,10 @@ export function apply(ctx, config = {}) {
     const rendered = renderEvent(effective, { selfUserId, selfName })
     if (rendered === null || rendered.text.trim() === '') return
 
-    const interested = Object.values(bindings).filter(
-      (binding) => binding.enabled && roomKey(binding.roomId) === roomKey(roomId),
-    )
+    // One Session may hold several bindings; flatten before matching the room.
+    const interested = Object.values(bindings)
+      .flat()
+      .filter((binding) => binding.enabled && roomKey(binding.roomId) === roomKey(roomId))
     if (interested.length === 0) return
 
     const mentioned = rendered.mentionedSelf
@@ -715,7 +834,9 @@ export function apply(ctx, config = {}) {
     const senderName = await displayNameOf(effective.sender)
     // 名字缺失时补一次：私聊房间没有 m.room.name，只能从成员表里取对方的名字。
     const roomName = await ensureRoomName(roomId)
-    const memberCount = roomMemberCounts.get(roomKey(roomId)) ?? 0
+    // 用房间类型而不是成员数：服务器通知房间常常也只有两个成员，按人数会被
+    // 误标成「私聊」。
+    const kind = roomKinds.get(roomKey(roomId)) ?? 'room'
     const time = Number(effective.origin_server_ts) > 0 ? Number(effective.origin_server_ts) : Date.now()
 
     for (const binding of targeted) {
@@ -727,7 +848,7 @@ export function apply(ctx, config = {}) {
         time,
         body: rendered.text,
         authoritative: binding.authoritative,
-        memberCount,
+        kind,
       })
       try {
         const { parts, lines } = await collectMedia(binding.sessionId, fetched)
@@ -759,14 +880,16 @@ export function apply(ctx, config = {}) {
     return name
   }
 
-  function composeText({ roomId, roomName, senderName, senderId, time, body, authoritative, memberCount }) {
+  function composeText({ roomId, roomName, senderName, senderId, time, body, authoritative, kind }) {
     if (authoritative) return body
     const who = `「${senderName !== '' ? senderName : senderId}」(${senderId})`
-    // 两个成员就是私聊：房间名本来就是对方的名字，再写一遍只是噪声。
+    // 私聊与通知都不写房间名：房间名本来就是对方/服务器的名字，再写一遍只是噪声。
     const head =
-      memberCount === 2
+      kind === 'dm'
         ? `[Matrix 私聊] 来自${who}，${formatStamp(time)}`
-        : `[Matrix 房间] 「${roomName}」(${roomId}) 中 来自${who}，${formatStamp(time)}`
+        : kind === 'notice'
+          ? `[Matrix 通知] 来自${who}，${formatStamp(time)}`
+          : `[Matrix 房间] 「${roomName}」(${roomId}) 中 来自${who}，${formatStamp(time)}`
     return `${head}\n${UNTRUSTED_NOTICE}\n\n${body}`
   }
 
@@ -889,17 +1012,23 @@ export function apply(ctx, config = {}) {
       signal,
     )
     const queue = waitingReply.get(binding.sessionId) ?? []
-    // The requestId is the only handle that ties this admission to the turn it
-    // opens: the host echoes it back on the `user/message` event as `source.rpcId`.
-    queue.push({
-      roomId: binding.roomId,
-      roomName: binding.roomName,
-      at: Date.now(),
-      requestId,
-      admitted: false,
-    })
-    waitingReply.set(binding.sessionId, queue)
-    note('admitted', `已把消息投递给会话 ${binding.sessionId.slice(0, 8)}`)
+    // `reply: false` 的绑定（服务器通知房间）只投递、不排队等回复。
+    if (binding.reply !== false) {
+      // The requestId is the only handle that ties this admission to the turn it
+      // opens: the host echoes it back on the `user/message` event as `source.rpcId`.
+      queue.push({
+        roomId: binding.roomId,
+        roomName: binding.roomName,
+        at: Date.now(),
+        requestId,
+        admitted: false,
+      })
+      waitingReply.set(binding.sessionId, queue)
+    }
+    note(
+      'admitted',
+      `已把消息投递给会话 ${binding.sessionId.slice(0, 8)}${binding.reply === false ? '（不回复）' : ''}`,
+    )
   }
 
   /* ---------------------------------------------------------- outbound */
@@ -1083,11 +1212,15 @@ export function apply(ctx, config = {}) {
           let roomId = await resolvedRoom(args?.room)
           if (roomId === '') {
             const sessionId = exec?.sessionId ?? exec?.agent?.sessionId ?? ''
-            const binding = bindings[sessionId]
-            if (binding === undefined) {
+            const list = bindings[sessionId] ?? []
+            if (list.length === 0) {
               throw new Error('没有指定房间，且这个会话没有关联任何 Matrix 房间')
             }
-            roomId = binding.roomId
+            if (list.length > 1) {
+              const names = list.map((binding) => binding.roomName || binding.roomId).join('、')
+              throw new Error(`这个会话关联了 ${list.length} 个房间，请用 room 参数指定：${names}`)
+            }
+            roomId = list[0].roomId
           }
           const eventId = await sendText(roomId, text)
           return { ok: true, roomId, eventId }
@@ -1096,13 +1229,20 @@ export function apply(ctx, config = {}) {
       {
         name: 'matrix_rooms',
         description:
-          'List the Matrix rooms this bridge can see, with their encryption state and whether a DSH session is bound to each. Use to find the right room before sending.',
+          'List the Matrix rooms this bridge can see, with their encryption state and which DSH sessions are bound to each. Use to find the right room before sending.',
         parameters: { type: 'object', properties: {}, additionalProperties: false },
         isConcurrencySafe: () => true,
         timeoutMs: 30_000,
         async execute() {
           const bound = new Map()
-          for (const binding of Object.values(bindings)) bound.set(roomKey(binding.roomId), binding.sessionId)
+          for (const list of Object.values(bindings)) {
+            for (const binding of list) {
+              const key = roomKey(binding.roomId)
+              const sessions = bound.get(key) ?? []
+              sessions.push(binding.sessionId)
+              bound.set(key, sessions)
+            }
+          }
           return {
             ok: true,
             connected: running,
@@ -1110,7 +1250,7 @@ export function apply(ctx, config = {}) {
               key,
               name,
               encrypted: roomEncrypted.has(key),
-              sessionId: bound.get(key) ?? null,
+              sessionIds: bound.get(key) ?? [],
             })),
           }
         },
@@ -1149,6 +1289,7 @@ export function apply(ctx, config = {}) {
     autoConnect: connection.autoConnect,
     acceptInvites: connection.acceptInvites,
     syncTimeoutMs: connection.syncTimeoutMs,
+    noticeSessionId: connection.noticeSessionId,
     connected: running,
     nextBatch: nextBatch === '' ? '' : `${nextBatch.slice(0, 12)}…`,
     frames: syncFrames,
@@ -1191,12 +1332,18 @@ export function apply(ctx, config = {}) {
       const withName = (binding) =>
         binding === null || binding === undefined
           ? null
-          : { ...binding, roomName: roomNames.get(roomKey(binding.roomId)) ?? binding.roomName }
+          : {
+              ...binding,
+              roomName: roomNames.get(roomKey(binding.roomId)) ?? binding.roomName,
+              kind: roomKinds.get(roomKey(binding.roomId)) ?? 'room',
+            }
       sendJson(res, 200, {
         ok: true,
         connection: statusOf(),
-        binding: withName(bindings[sessionId]),
-        bindings: Object.values(bindings).map(withName),
+        // `binding` is the list for this Session (0.1.x returned a single
+        // object); `bindings` is every binding across the profile.
+        binding: (bindings[sessionId] ?? []).map(withName),
+        bindings: Object.values(bindings).flat().map(withName),
         sessions: Object.keys(bindings),
         rooms: [...roomNames.entries()].map(([key, name]) => ({
           key,
@@ -1205,6 +1352,7 @@ export function apply(ctx, config = {}) {
           roomId: serverRoomIds.get(key) ?? `!${key}`,
           name,
           encrypted: roomEncrypted.has(key),
+          kind: roomKinds.get(key) ?? 'room',
         })),
         deps,
         canDeliver: typeof sessionController()?.prompt === 'function',
@@ -1227,6 +1375,8 @@ export function apply(ctx, config = {}) {
         disconnect()
         void connect()
       }
+      // 改了通知房间的目标会话就立刻扫一遍，不必等下一帧 sync。
+      if (before.noticeSessionId !== connection.noticeSessionId) void autoBindNotices()
       sendJson(res, 200, { ok: true, connection: statusOf() })
     })
 
@@ -1275,6 +1425,7 @@ export function apply(ctx, config = {}) {
         // 绑定这一刻就把名字解析出来：私聊房间没有 m.room.name，只能从成员表取。
         await ensureRoomName(roomId)
       }
+      const kind = roomKinds.get(roomKey(roomId)) ?? 'room'
       const binding = normalizeBinding(
         {
           roomId,
@@ -1283,6 +1434,8 @@ export function apply(ctx, config = {}) {
           mentionOnly: body.mentionOnly,
           enabled: body.enabled,
           authoritative: body.authoritative,
+          // 服务器通知房间默认只收不回；其它房间默认回复。
+          reply: body.reply === undefined ? kind !== 'notice' : body.reply === true,
           updatedAt: Date.now(),
         },
         sessionId,
@@ -1291,40 +1444,65 @@ export function apply(ctx, config = {}) {
         sendJson(res, 400, { ok: false, error: 'roomId 不能为空' })
         return
       }
-      bindings = { ...bindings, [sessionId]: binding }
+      // 追加而不是覆盖：一个会话可以同时接私聊、群聊和服务器通知房间。
+      const list = (bindings[sessionId] ?? []).filter(
+        (item) => roomKey(item.roomId) !== roomKey(binding.roomId),
+      )
+      list.push(binding)
+      bindings = { ...bindings, [sessionId]: list }
       writeBindings(home, bindings)
       note('bound', `会话 ${sessionId.slice(0, 8)} 关联到房间 ${binding.roomName || binding.roomId}`)
-      sendJson(res, 200, { ok: true, binding })
+      sendJson(res, 200, { ok: true, binding, bindings: list })
     })
 
     route(`${ROUTE_PREFIX}/unbind`, 'POST', async (req, res) => {
       const body = await readJson(req)
       const sessionId = typeof body.sessionId === 'string' ? body.sessionId : ''
-      const next = { ...bindings }
-      delete next[sessionId]
-      bindings = next
+      const roomId = String(body.roomId ?? '').trim()
+      const current = bindings[sessionId] ?? []
+      // 带 roomId 只解除那一个；不带就清空这个会话的全部关联。
+      const next = roomId === ''
+        ? []
+        : current.filter((item) => roomKey(item.roomId) !== roomKey(roomId))
+      const map = { ...bindings }
+      if (next.length === 0) delete map[sessionId]
+      else map[sessionId] = next
+      bindings = map
       writeBindings(home, bindings)
-      sendJson(res, 200, { ok: true, binding: null })
+      sendJson(res, 200, { ok: true, binding: next })
     })
 
     route(`${ROUTE_PREFIX}/options`, 'POST', async (req, res) => {
       const body = await readJson(req)
       const sessionId = typeof body.sessionId === 'string' ? body.sessionId : ''
-      const current = bindings[sessionId]
-      if (current === undefined) {
+      const roomId = String(body.roomId ?? '').trim()
+      const current = bindings[sessionId] ?? []
+      if (current.length === 0) {
         sendJson(res, 400, { ok: false, error: '这个会话还没有关联 Matrix 房间' })
         return
       }
+      // 选项按房间独立：群聊要「仅被@」，私聊不要，两者可以同时绑在同一个会话上。
+      const index = roomId === ''
+        ? 0
+        : current.findIndex((item) => roomKey(item.roomId) === roomKey(roomId))
+      if (index === -1) {
+        sendJson(res, 400, { ok: false, error: `这个会话没有关联房间 ${roomId}` })
+        return
+      }
+      const target = current[index]
       const next = {
-        ...current,
-        mentionOnly: body.mentionOnly === undefined ? current.mentionOnly : body.mentionOnly === true,
-        authoritative: body.authoritative === undefined ? current.authoritative : body.authoritative === true,
-        enabled: body.enabled === undefined ? current.enabled : body.enabled === true,
+        ...target,
+        mentionOnly: body.mentionOnly === undefined ? target.mentionOnly : body.mentionOnly === true,
+        authoritative: body.authoritative === undefined ? target.authoritative : body.authoritative === true,
+        enabled: body.enabled === undefined ? target.enabled : body.enabled === true,
+        reply: body.reply === undefined ? target.reply : body.reply === true,
         updatedAt: Date.now(),
       }
-      bindings = { ...bindings, [sessionId]: next }
+      const list = current.slice()
+      list[index] = next
+      bindings = { ...bindings, [sessionId]: list }
       writeBindings(home, bindings)
-      sendJson(res, 200, { ok: true, binding: next })
+      sendJson(res, 200, { ok: true, binding: next, bindings: list })
     })
 
     route(`${ROUTE_PREFIX}/rooms`, 'GET', async (req, res) => {
@@ -1341,6 +1519,7 @@ export function apply(ctx, config = {}) {
             roomId,
             name: roomNames.get(key) ?? roomId,
             encrypted: roomEncrypted.has(key),
+            kind: roomKinds.get(key) ?? 'room',
           })
         }
         sendJson(res, 200, { ok: true, available: true, rooms })
